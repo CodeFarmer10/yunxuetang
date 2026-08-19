@@ -1,89 +1,193 @@
 # Database Query Tool
 
-A web-based tool for managing PostgreSQL database connections, viewing metadata, and executing SQL queries with natural language support.
+A web-based intelligent database query tool for managing database connections,
+viewing metadata, running SQL queries, generating SQL from natural language, and
+exporting query results.
+
+This project is based on `tyrchen/geektime-bootcamp-ai/w2/db_query` and extends
+the query workflow with result export features.
+
+## Features
+
+- Database connection management for PostgreSQL and MySQL.
+- Metadata browsing for tables, views, columns, primary keys, and row counts.
+- Manual SQL query execution with result preview.
+- Natural-language-to-SQL generation through OpenAI.
+- Query history recording.
+- Query result export to CSV and JSON.
+- One-click `EXECUTE & EXPORT` workflow for running a query and immediately
+  downloading the result.
+- Query-success prompt that asks whether the latest result should be exported.
+
+## Export Workflow
+
+After running a query, the results card provides two direct export buttons:
+
+- `EXPORT CSV`
+- `EXPORT JSON`
+
+The manual SQL toolbar also includes `EXECUTE & EXPORT`, a dropdown command with
+two automated actions:
+
+- Execute and export CSV
+- Execute and export JSON
+
+For normal `EXECUTE`, the UI prompts after a successful query:
+
+```text
+Export query result?
+Need to export this query result as CSV or JSON?
+```
+
+CSV export escapes commas, quotes, and newlines. JSON export includes query
+metadata plus rows:
+
+- `sql`
+- `rowCount`
+- `executionTimeMs`
+- `columns`
+- `rows`
+- `exportedAt`
 
 ## Project Structure
 
-```
-w2/db_query/
-├── backend/          # FastAPI backend (Python 3.12+)
-├── frontend/         # React frontend (TypeScript, Refine 5)
-├── fixtures/         # REST Client test files
-│   ├── test.rest     # API test requests
-│   └── README.md     # Testing guide
-└── Makefile          # Development commands
+```text
+.
+├── backend/          # FastAPI backend
+├── frontend/         # React + TypeScript + Vite frontend
+├── Makefile          # Development shortcuts
+└── README.md
 ```
 
-## Quick Start
+## Requirements
 
-### Initial Setup
+- Python 3.12+
+- Node.js 22+
+- `uv` is supported by the Makefile, but a standard Python virtual environment
+  also works.
+
+## Backend Setup
+
+Using `uv`:
 
 ```bash
-# Install all dependencies
-make install
-
-# Setup database and environment
-make setup
-# Then edit backend/.env and add your OPENAI_API_KEY
-
-# Start development servers
-make dev
+cd backend
+uv sync --extra dev
+cp .env.example .env
 ```
 
-### Development Commands
+Using `venv` and `pip`:
 
 ```bash
-# View all available commands
+cd backend
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+cp .env.example .env
+```
+
+Edit `backend/.env` and set:
+
+```text
+OPENAI_API_KEY=your-openai-api-key
+```
+
+For database connection management and manual SQL execution, this key is only
+required because the backend settings load it at startup. Natural-language SQL
+generation requires a real key.
+
+Start the backend:
+
+```bash
+cd backend
+.venv/bin/python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+```
+
+Health check:
+
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+## Frontend Setup
+
+```bash
+cd frontend
+npm install
+npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+Open:
+
+```text
+http://127.0.0.1:5173/
+```
+
+The frontend defaults to:
+
+```text
+http://localhost:8000
+```
+
+Override it with `VITE_API_BASE_URL` if needed.
+
+## Example MySQL Connection
+
+Use a short database name in the `Database Name` field and put the full URL in
+the `Connection URL` field.
+
+```text
+Database Name: fraud_app
+Connection URL: mysql://root:Rzxmaxc@123@10.128.13.67:3306/fraud_app
+```
+
+Do not put the full `mysql://...` URL into the `Database Name` field.
+
+## Development Commands
+
+```bash
+# View Makefile commands
 make help
 
-# Start backend only
+# Start backend
 make dev-backend
 
-# Start frontend only
+# Start frontend
 make dev-frontend
 
-# Run tests
+# Run all tests
 make test
 
-# Format code
-make format
-
-# Run linters
+# Run lint checks
 make lint
 ```
 
-## API Testing
+## Verification
 
-### Using REST Client (VSCode)
-
-1. Install [REST Client extension](https://marketplace.visualstudio.com/items?itemName=humao.rest-client)
-2. Open `fixtures/test.rest`
-3. Click "Send Request" above any HTTP request
-4. View responses in VSCode panel
-
-See `fixtures/README.md` for detailed testing guide.
-
-### Using Makefile
+Frontend export utility tests:
 
 ```bash
-# Check if backend is running
-make health
-
-# Open API documentation
-make docs
+cd frontend
+npm test -- --run src/utils/exportResult.test.ts
 ```
 
-## Phase 1 Status
+Frontend production build:
 
-✅ **Phase 1 Complete**: All setup and foundation tasks completed.
+```bash
+cd frontend
+npm run build
+```
 
-- Backend project structure initialized
-- Frontend project structure initialized
-- Core infrastructure (FastAPI, database, models) ready
-- Data models defined with camelCase API convention
-- Makefile with common development tasks
-- REST Client test file for API testing
+Backend import check:
 
-## Next Steps
+```bash
+cd backend
+OPENAI_API_KEY=not-used-for-import .venv/bin/python -c 'from app.main import app; print(app.title)'
+```
 
-Proceed to Phase 2 for core feature implementation (US1 + US2).
+## Notes
+
+- `.env`, virtual environments, `node_modules`, and build outputs are ignored by
+  git.
+- `backend/.env.example` is committed as the environment template.
+- SQLite metadata for saved database connections is stored under
+  `~/.db_query/db_query.db` by default.
