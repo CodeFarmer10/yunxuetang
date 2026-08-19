@@ -1,0 +1,126 @@
+"""API request/response schemas with camelCase aliases."""
+
+from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal, Any
+from datetime import datetime
+from app.models.query import QuerySource
+
+
+class ApiModel(BaseModel):
+    """Base API model that accepts Python field names and emits aliases."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+# Database Connection Schemas
+class DatabaseConnectionInput(ApiModel):
+    """Input schema for creating/updating database connection."""
+
+    url: str = Field(..., description="Database connection URL (PostgreSQL or MySQL)")
+    db_type: str | None = Field(default=None, alias="dbType", description="Database type (postgresql or mysql). Auto-detected from URL if not provided.")
+    description: str | None = Field(default=None, max_length=200)
+
+
+class DatabaseConnectionResponse(ApiModel):
+    """Response schema for database connection."""
+
+    name: str
+    url: str
+    db_type: str = Field(..., alias="dbType")
+    description: str | None
+    created_at: datetime
+    updated_at: datetime
+    last_connected_at: datetime | None
+    status: str
+
+
+# Metadata Schemas
+class ColumnMetadata(ApiModel):
+    """Column metadata schema."""
+
+    name: str = Field(..., max_length=63)
+    data_type: str = Field(..., alias="dataType")
+    nullable: bool
+    primary_key: bool = Field(..., alias="primaryKey")
+    unique: bool = False
+    default_value: str | None = Field(default=None, alias="defaultValue")
+    comment: str | None = None
+
+
+class TableMetadata(ApiModel):
+    """Table/View metadata schema."""
+
+    name: str = Field(..., max_length=63)
+    type: Literal["table", "view"]
+    columns: list[ColumnMetadata]
+    row_count: int | None = Field(default=None, alias="rowCount")
+    schema_name: str = Field(default="public", alias="schemaName")
+
+
+class DatabaseMetadataResponse(ApiModel):
+    """Response schema for database metadata."""
+
+    database_name: str = Field(..., alias="databaseName")
+    tables: list[TableMetadata]
+    views: list[TableMetadata]
+    fetched_at: datetime = Field(..., alias="fetchedAt")
+    is_stale: bool = Field(..., alias="isStale")
+
+
+# Query Schemas
+class QueryInput(ApiModel):
+    """Input schema for SQL query execution."""
+
+    sql: str = Field(..., min_length=1, description="SQL SELECT query to execute")
+
+
+class QueryColumn(ApiModel):
+    """Query result column schema."""
+
+    name: str
+    data_type: str = Field(..., alias="dataType")
+
+
+class QueryResult(ApiModel):
+    """Query result response schema."""
+
+    columns: list[QueryColumn]
+    rows: list[dict[str, Any]]
+    row_count: int = Field(..., alias="rowCount")
+    execution_time_ms: int = Field(..., alias="executionTimeMs")
+    sql: str
+
+
+class QueryHistoryEntry(ApiModel):
+    """Query history entry schema."""
+
+    id: int
+    database_name: str = Field(..., alias="databaseName")
+    sql_text: str = Field(..., alias="sqlText")
+    executed_at: datetime = Field(..., alias="executedAt")
+    execution_time_ms: int | None = Field(None, alias="executionTimeMs")
+    row_count: int | None = Field(None, alias="rowCount")
+    success: bool
+    error_message: str | None = Field(None, alias="errorMessage")
+    query_source: str = Field(..., alias="querySource")
+
+
+# Natural Language Schemas
+class NaturalLanguageInput(ApiModel):
+    """Input schema for natural language to SQL conversion."""
+
+    prompt: str = Field(..., min_length=5, max_length=500)
+
+
+class GeneratedSqlResponse(ApiModel):
+    """Response schema for generated SQL."""
+
+    sql: str
+    explanation: str
+
+
+# Error Schema
+class ErrorResponse(ApiModel):
+    """Error response schema."""
+
+    error: dict[str, Any]
