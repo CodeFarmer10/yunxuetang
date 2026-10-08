@@ -42,7 +42,11 @@ class SQLGenerator:
             config: OpenAI configuration including API key and model settings.
         """
         self.config = config
-        self.client = AsyncOpenAI(api_key=config.api_key.get_secret_value(), timeout=config.timeout)
+        self.client = AsyncOpenAI(
+            api_key=config.api_key.get_secret_value(),
+            base_url=config.base_url,
+            timeout=config.timeout,
+        )
 
     async def generate(
         self,
@@ -184,7 +188,7 @@ class SQLGenerator:
         matches = re.findall(code_block_pattern, content, re.DOTALL | re.IGNORECASE)
 
         if matches:
-            sql = matches[0].strip()
+            sql = str(matches[0]).strip()
             # Remove trailing semicolon for consistency
             return sql.rstrip(";") + ";"
 
@@ -193,7 +197,7 @@ class SQLGenerator:
         matches = re.findall(sql_pattern, content, re.DOTALL | re.IGNORECASE)
 
         if matches:
-            sql = matches[0].strip()
+            sql = str(matches[0]).strip()
             return sql.rstrip(";") + ";"
 
         # Strategy 3: Check if entire content looks like SQL

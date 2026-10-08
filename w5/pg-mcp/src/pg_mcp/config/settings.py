@@ -5,10 +5,10 @@ and type safety. Configuration is loaded from environment variables with
 sensible defaults.
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class DatabaseConfig(BaseSettings):
@@ -44,13 +44,19 @@ class DatabaseConfig(BaseSettings):
 
 
 class OpenAIConfig(BaseSettings):
-    """OpenAI API configuration."""
+    """OpenAI and OpenAI-compatible API configuration."""
 
     model_config = SettingsConfigDict(env_prefix="OPENAI_")
 
-    api_key: SecretStr = Field(default=SecretStr(""), description="OpenAI API key")
+    api_key: SecretStr = Field(default=SecretStr(""), description="LLM provider API key")
+    base_url: str | None = Field(
+        default=None,
+        description="Optional base URL for an OpenAI-compatible provider",
+    )
     model: str = Field(default="gpt-4o-mini", description="Model to use for SQL generation")
-    max_tokens: int = Field(default=2000, ge=100, le=4096, description="Maximum tokens in response")
+    max_tokens: int = Field(
+        default=2000, ge=100, le=32768, description="Maximum tokens in response"
+    )
     temperature: float = Field(
         default=0.0, ge=0.0, le=2.0, description="Temperature for response randomness"
     )
@@ -61,13 +67,22 @@ class OpenAIConfig(BaseSettings):
     @field_validator("api_key")
     @classmethod
     def validate_api_key(cls, v: SecretStr) -> SecretStr:
-        """Validate API key is not empty and has correct format."""
+        """Validate that the provider API key is not empty."""
         api_key_str = v.get_secret_value()
         if not api_key_str or not api_key_str.strip():
-            raise ValueError("OpenAI API key must not be empty")
-        if not api_key_str.startswith("sk-"):
-            raise ValueError("OpenAI API key must start with 'sk-'")
+            raise ValueError("LLM provider API key must not be empty")
         return v
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, v: str | None) -> str | None:
+        """Normalize and validate an optional OpenAI-compatible endpoint."""
+        if v is None:
+            return None
+        normalized = v.strip().rstrip("/")
+        if not normalized.startswith(("http://", "https://")):
+            raise ValueError("OpenAI-compatible base URL must start with http:// or https://")
+        return normalized
 
 
 class SecurityConfig(BaseSettings):
@@ -78,7 +93,7 @@ class SecurityConfig(BaseSettings):
     allow_write_operations: bool = Field(
         default=False, description="Allow write operations (INSERT, UPDATE, DELETE)"
     )
-    blocked_functions: list[str] = Field(
+    blocked_functions: Annotated[list[str], NoDecode] = Field(
         default_factory=lambda: [
             "pg_sleep",
             "pg_read_file",
@@ -98,11 +113,18 @@ class SecurityConfig(BaseSettings):
     safe_search_path: str = Field(
         default="public", description="Safe search_path to set during query execution"
     )
+    blocked_tables: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, description="Tables that queries are not allowed to access"
+    )
+    blocked_columns: Annotated[list[str], NoDecode] = Field(
+        default_factory=list, description="Columns that queries are not allowed to access"
+    )
+    allow_explain: bool = Field(default=False, description="Allow EXPLAIN statements")
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator("blocked_functions", "blocked_tables", "blocked_columns", mode="before")
     @classmethod
-    def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
-        """Parse comma-separated string or list."""
+    def parse_security_list(cls, v: str | list[str]) -> list[str]:
+        """Parse comma-separated security lists from environment variables."""
         if isinstance(v, str):
             return [f.strip() for f in v.split(",") if f.strip()]
         return v
@@ -163,6 +185,15 @@ class ResilienceConfig(BaseSettings):
     circuit_breaker_timeout: float = Field(
         default=60.0, ge=10.0, le=300.0, description="Circuit breaker timeout in seconds"
     )
+    max_concurrent_queries: int = Field(
+        default=10, ge=1, le=1000, description="Maximum concurrent query requests"
+    )
+    max_concurrent_llm_calls: int = Field(
+        default=5, ge=1, le=1000, description="Maximum concurrent LLM calls"
+    )
+    rate_limit_timeout: float = Field(
+        default=1.0, ge=0.01, le=60.0, description="Seconds to wait for a rate-limit slot"
+    )
 
 
 class ObservabilityConfig(BaseSettings):
@@ -177,7 +208,7 @@ class ObservabilityConfig(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(
         default="INFO", description="Logging level"
     )
-    log_format: Literal["json", "text"] = Field(default="text", description="Log format")
+    log_format: Literal["json", "text"] = Field(default="json", description="Log format")
 
 
 class Settings(BaseSettings):
@@ -186,6 +217,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        env_nested_delimiter="_",
+        env_nested_max_split=1,
         case_sensitive=False,
         extra="ignore",
     )
@@ -196,12 +229,29 @@ class Settings(BaseSettings):
 
     # Nested configurations
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    databases: list[DatabaseConfig] = Field(
+        default_factory=list,
+        description="Optional multi-database configuration; falls back to database when empty",
+    )
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
     cache: CacheConfig = Field(default_factory=CacheConfig)
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
+
+    @model_validator(mode="after")
+    def validate_database_names(self) -> "Settings":
+        """Ensure configured database names are unique."""
+        names = [config.name for config in self.configured_databases]
+        if len(names) != len(set(names)):
+            raise ValueError("Configured database names must be unique")
+        return self
+
+    @property
+    def configured_databases(self) -> list[DatabaseConfig]:
+        """Return multi-database configuration with single-database fallback."""
+        return self.databases or [self.database]
 
     @property
     def is_production(self) -> bool:

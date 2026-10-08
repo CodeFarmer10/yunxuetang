@@ -5,8 +5,9 @@ of the query processing pipeline: SQL generation, validation, execution, and res
 validation. It implements retry logic, error handling, and request tracking.
 """
 
+import asyncio
 import logging
-import uuid
+import time
 from typing import Any
 
 from asyncpg import Pool
@@ -18,6 +19,8 @@ from pg_mcp.models.errors import (
     ErrorCode,
     LLMError,
     PgMcpError,
+    QuestionTooLongError,
+    RateLimitExceededError,
     SchemaLoadError,
     SecurityViolationError,
     SQLParseError,
@@ -30,7 +33,10 @@ from pg_mcp.models.query import (
     ReturnType,
     ValidationResult,
 )
+from pg_mcp.observability.metrics import MetricsCollector
+from pg_mcp.observability.tracing import request_context
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker
+from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.result_validator import ResultValidator
 from pg_mcp.services.sql_executor import SQLExecutor
 from pg_mcp.services.sql_generator import SQLGenerator
@@ -73,6 +79,10 @@ class QueryOrchestrator:
         pools: dict[str, Pool],
         resilience_config: ResilienceConfig,
         validation_config: ValidationConfig,
+        sql_executors: dict[str, SQLExecutor] | None = None,
+        metrics: MetricsCollector | None = None,
+        rate_limiter: MultiRateLimiter | None = None,
+        circuit_breaker: CircuitBreaker | None = None,
     ) -> None:
         """Initialize query orchestrator.
 
@@ -89,19 +99,54 @@ class QueryOrchestrator:
         self.sql_generator = sql_generator
         self.sql_validator = sql_validator
         self.sql_executor = sql_executor
+        self.sql_executors = sql_executors or dict.fromkeys(pools, sql_executor)
         self.result_validator = result_validator
         self.schema_cache = schema_cache
         self.pools = pools
         self.resilience_config = resilience_config
         self.validation_config = validation_config
+        self.metrics = metrics
+        self.rate_limiter = rate_limiter
 
         # Create circuit breaker for LLM calls
-        self.circuit_breaker = CircuitBreaker(
+        self.circuit_breaker = circuit_breaker or CircuitBreaker(
             failure_threshold=resilience_config.circuit_breaker_threshold,
             recovery_timeout=resilience_config.circuit_breaker_timeout,
         )
 
     async def execute_query(self, request: QueryRequest) -> QueryResponse:
+        """Execute a request with tracing, rate limiting, and request metrics."""
+        started_at = time.perf_counter()
+        database_label = request.database or "auto"
+
+        async with request_context() as request_id:
+            try:
+                if self.rate_limiter is None:
+                    response = await self._execute_query(request, request_id)
+                else:
+                    try:
+                        async with self.rate_limiter.for_queries(
+                            timeout=self.resilience_config.rate_limit_timeout
+                        ):
+                            response = await self._execute_query(request, request_id)
+                    except TimeoutError as e:
+                        raise RateLimitExceededError(
+                            message="Too many concurrent query requests",
+                            details={
+                                "retry_after_seconds": self.resilience_config.rate_limit_timeout
+                            },
+                        ) from e
+            except PgMcpError as error:
+                response = self._error_response(error)
+
+        if self.metrics is not None:
+            status = "success" if response.success else "error"
+            self.metrics.increment_query_request(status, database_label)
+            self.metrics.query_duration.observe(time.perf_counter() - started_at)
+
+        return response
+
+    async def _execute_query(self, request: QueryRequest, request_id: str) -> QueryResponse:
         """Execute complete query flow from question to results.
 
         This method orchestrates the entire pipeline:
@@ -126,14 +171,24 @@ class QueryOrchestrator:
             >>> if response.success:
             ...     print(f"Found {response.data.row_count} rows")
         """
-        # Generate request_id for full-chain tracing
-        request_id = str(uuid.uuid4())
         logger.info(
             "Starting query execution",
             extra={"request_id": request_id, "question": request.question[:100]},
         )
 
         try:
+            if len(request.question) > self.validation_config.max_question_length:
+                raise QuestionTooLongError(
+                    message=(
+                        "Question exceeds configured maximum length of "
+                        f"{self.validation_config.max_question_length} characters"
+                    ),
+                    details={
+                        "length": len(request.question),
+                        "max_length": self.validation_config.max_question_length,
+                    },
+                )
+
             # Step 1: Resolve database name
             database_name = self._resolve_database(request.database)
             logger.debug(
@@ -195,7 +250,18 @@ class QueryOrchestrator:
             logger.debug("Executing SQL", extra={"request_id": request_id})
             start_time = self._get_current_time_ms()
 
-            results, total_count = await self.sql_executor.execute(generated_sql)
+            executor = self.sql_executors.get(database_name)
+            if executor is None:
+                raise DatabaseError(
+                    message=f"No SQL executor available for database '{database_name}'",
+                    details={"database": database_name},
+                )
+
+            results, total_count = await self._execute_sql_with_retry(
+                executor=executor,
+                sql=generated_sql,
+                request_id=request_id,
+            )
 
             execution_time_ms = self._get_current_time_ms() - start_time
             logger.info(
@@ -257,6 +323,7 @@ class QueryOrchestrator:
                 confidence=0,
                 tokens_used=None,
             )
+
         except Exception as e:
             # Handle unexpected errors
             logger.exception(
@@ -276,6 +343,23 @@ class QueryOrchestrator:
                 confidence=0,
                 tokens_used=None,
             )
+
+    @staticmethod
+    def _error_response(error: PgMcpError) -> QueryResponse:
+        """Convert an application error into a stable query response."""
+        return QueryResponse(
+            success=False,
+            generated_sql=None,
+            validation=None,
+            data=None,
+            error=ErrorDetail(
+                code=error.code.value,
+                message=error.message,
+                details=error.details,
+            ),
+            confidence=0,
+            tokens_used=0,
+        )
 
     def _resolve_database(self, database: str | None) -> str:
         """Resolve database name from request or auto-select.
@@ -322,6 +406,44 @@ class QueryOrchestrator:
         raise DatabaseError(
             message="Multiple databases available, please specify which to query",
             details={"available_databases": available_dbs},
+        )
+
+    async def _execute_sql_with_retry(
+        self,
+        executor: SQLExecutor,
+        sql: str,
+        request_id: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Execute read-only SQL with exponential backoff for transient database errors."""
+        max_retries = self.resilience_config.max_retries
+
+        for attempt in range(max_retries + 1):
+            started_at = time.perf_counter()
+            try:
+                results = await executor.execute(sql)
+                if self.metrics is not None:
+                    self.metrics.observe_db_query_duration(time.perf_counter() - started_at)
+                return results
+            except DatabaseError:
+                if attempt >= max_retries:
+                    raise
+                delay = self._retry_delay(attempt)
+                logger.warning(
+                    "Database query failed, retrying",
+                    extra={
+                        "request_id": request_id,
+                        "attempt": attempt + 1,
+                        "retry_delay_seconds": delay,
+                    },
+                )
+                await asyncio.sleep(delay)
+
+        raise DatabaseError(message="Database query failed after retries")
+
+    def _retry_delay(self, attempt: int) -> float:
+        """Calculate exponential retry delay for a zero-based retry attempt."""
+        return self.resilience_config.retry_delay * (
+            self.resilience_config.backoff_factor**attempt
         )
 
     async def _generate_sql_with_retry(
@@ -385,13 +507,40 @@ class QueryOrchestrator:
                     },
                 )
 
-                # Generate SQL
-                generated_sql = await self.sql_generator.generate(
-                    question=question,
-                    schema=schema,
-                    previous_attempt=previous_sql,
-                    error_feedback=error_feedback,
-                )
+                # Generate SQL while enforcing the configured LLM concurrency limit.
+                llm_started_at = time.perf_counter()
+                if self.metrics is not None:
+                    self.metrics.increment_llm_call("generate_sql")
+                try:
+                    if self.rate_limiter is None:
+                        generated_sql = await self.sql_generator.generate(
+                            question=question,
+                            schema=schema,
+                            previous_attempt=previous_sql,
+                            error_feedback=error_feedback,
+                        )
+                    else:
+                        async with self.rate_limiter.for_llm(
+                            timeout=self.resilience_config.rate_limit_timeout
+                        ):
+                            generated_sql = await self.sql_generator.generate(
+                                question=question,
+                                schema=schema,
+                                previous_attempt=previous_sql,
+                                error_feedback=error_feedback,
+                            )
+                except TimeoutError as e:
+                    raise RateLimitExceededError(
+                        message="Too many concurrent LLM requests",
+                        details={
+                            "retry_after_seconds": self.resilience_config.rate_limit_timeout
+                        },
+                    ) from e
+                finally:
+                    if self.metrics is not None:
+                        self.metrics.observe_llm_latency(
+                            "generate_sql", time.perf_counter() - llm_started_at
+                        )
 
                 # Note: tokens_used would come from OpenAI response metadata if available
                 # For now, we don't extract it, but it can be added later
@@ -408,6 +557,8 @@ class QueryOrchestrator:
                 try:
                     self.sql_validator.validate_or_raise(generated_sql)
                 except (SecurityViolationError, SQLParseError) as validation_error:
+                    if self.metrics is not None:
+                        self.metrics.increment_sql_rejected(type(validation_error).__name__)
                     if attempt < max_retries:
                         # Record as failure and retry with feedback
                         logger.warning(
@@ -420,6 +571,7 @@ class QueryOrchestrator:
                         )
                         previous_sql = generated_sql
                         error_feedback = str(validation_error)
+                        await asyncio.sleep(self._retry_delay(attempt))
                         continue
                     else:
                         # Out of retries, record failure and raise
@@ -455,8 +607,24 @@ class QueryOrchestrator:
 
                 return generated_sql, validation_result, tokens_used
 
-            except (LLMError, SecurityViolationError, SQLParseError):
-                # Re-raise known errors
+            except LLMError as error:
+                self.circuit_breaker.record_failure()
+                if attempt < max_retries:
+                    delay = self._retry_delay(attempt)
+                    logger.warning(
+                        "LLM generation failed, retrying",
+                        extra={
+                            "request_id": request_id,
+                            "attempt": attempt + 1,
+                            "retry_delay_seconds": delay,
+                            "error": str(error),
+                        },
+                    )
+                    error_feedback = str(error)
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+            except (RateLimitExceededError, SecurityViolationError, SQLParseError):
                 raise
             except Exception as e:
                 # Unexpected error during generation
@@ -518,12 +686,32 @@ class QueryOrchestrator:
                 extra={"request_id": request_id},
             )
 
-            validation_result = await self.result_validator.validate(
-                question=question,
-                sql=sql,
-                results=results,
-                row_count=row_count,
-            )
+            llm_started_at = time.perf_counter()
+            if self.metrics is not None:
+                self.metrics.increment_llm_call("validate_result")
+            try:
+                if self.rate_limiter is None:
+                    validation_result = await self.result_validator.validate(
+                        question=question,
+                        sql=sql,
+                        results=results,
+                        row_count=row_count,
+                    )
+                else:
+                    async with self.rate_limiter.for_llm(
+                        timeout=self.resilience_config.rate_limit_timeout
+                    ):
+                        validation_result = await self.result_validator.validate(
+                            question=question,
+                            sql=sql,
+                            results=results,
+                            row_count=row_count,
+                        )
+            finally:
+                if self.metrics is not None:
+                    self.metrics.observe_llm_latency(
+                        "validate_result", time.perf_counter() - llm_started_at
+                    )
 
             logger.info(
                 "Result validation completed",
@@ -533,6 +721,16 @@ class QueryOrchestrator:
                     "is_acceptable": validation_result.is_acceptable,
                 },
             )
+
+            if validation_result.confidence < self.validation_config.min_confidence_score:
+                logger.warning(
+                    "Result confidence is below configured minimum",
+                    extra={
+                        "request_id": request_id,
+                        "confidence": validation_result.confidence,
+                        "minimum": self.validation_config.min_confidence_score,
+                    },
+                )
 
             return validation_result.confidence
 

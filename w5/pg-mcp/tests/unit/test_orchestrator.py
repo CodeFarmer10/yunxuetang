@@ -4,7 +4,7 @@ This module tests the orchestrator's coordination of the query pipeline,
 including retry logic, error handling, and integration with all components.
 """
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -22,6 +22,7 @@ from pg_mcp.models.query import (
 )
 from pg_mcp.models.schema import ColumnInfo, DatabaseSchema, TableInfo
 from pg_mcp.resilience.circuit_breaker import CircuitState
+from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.orchestrator import QueryOrchestrator
 
 
@@ -107,6 +108,95 @@ class TestDatabaseResolution:
             orchestrator._resolve_database(None)
 
         assert "no databases configured" in str(exc_info.value).lower()
+
+
+class TestRuntimeWiring:
+    """Test cross-cutting components are wired into the real request path."""
+
+    @pytest.mark.asyncio
+    async def test_selected_database_uses_matching_executor(self) -> None:
+        """The requested database must select both its schema and executor."""
+        schema = DatabaseSchema(database_name="db2", tables=[])
+        schema_cache = MagicMock()
+        schema_cache.get.return_value = schema
+        generator = AsyncMock()
+        generator.generate.return_value = "SELECT 2 AS value;"
+        validator = MagicMock()
+        db1_executor = AsyncMock()
+        db2_executor = AsyncMock()
+        db2_executor.execute.return_value = ([{"value": 2}], 1)
+
+        orchestrator = QueryOrchestrator(
+            sql_generator=generator,
+            sql_validator=validator,
+            sql_executor=db1_executor,
+            sql_executors={"db1": db1_executor, "db2": db2_executor},
+            result_validator=MagicMock(),
+            schema_cache=schema_cache,
+            pools={"db1": MagicMock(), "db2": MagicMock()},
+            resilience_config=ResilienceConfig(max_retries=0),
+            validation_config=ValidationConfig(enabled=False),
+        )
+
+        response = await orchestrator.execute_query(
+            QueryRequest(question="Return two", database="db2")
+        )
+
+        assert response.success is True
+        db2_executor.execute.assert_awaited_once_with("SELECT 2 AS value;")
+        db1_executor.execute.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_query_rate_limit_rejection_reaches_response(self) -> None:
+        """A saturated request limiter must produce a structured rate-limit error."""
+        limiter = MultiRateLimiter(query_limit=1, llm_limit=1)
+        await limiter.query_limiter.acquire()
+        try:
+            orchestrator = QueryOrchestrator(
+                sql_generator=MagicMock(),
+                sql_validator=MagicMock(),
+                sql_executor=MagicMock(),
+                result_validator=MagicMock(),
+                schema_cache=MagicMock(),
+                pools={"db": MagicMock()},
+                resilience_config=ResilienceConfig(rate_limit_timeout=0.01),
+                validation_config=ValidationConfig(),
+                rate_limiter=limiter,
+            )
+
+            response = await orchestrator.execute_query(QueryRequest(question="Count rows"))
+        finally:
+            limiter.query_limiter.release()
+
+        assert response.success is False
+        assert response.error is not None
+        assert response.error.code == "rate_limit_exceeded"
+
+    @pytest.mark.asyncio
+    async def test_database_retry_uses_configured_backoff(self) -> None:
+        """Transient database errors must retry with the configured delay."""
+        executor = AsyncMock()
+        executor.execute.side_effect = [DatabaseError("temporary"), ([{"value": 1}], 1)]
+        orchestrator = QueryOrchestrator(
+            sql_generator=MagicMock(),
+            sql_validator=MagicMock(),
+            sql_executor=executor,
+            result_validator=MagicMock(),
+            schema_cache=MagicMock(),
+            pools={"db": MagicMock()},
+            resilience_config=ResilienceConfig(
+                max_retries=1,
+                retry_delay=0.25,
+                backoff_factor=2.0,
+            ),
+            validation_config=ValidationConfig(),
+        )
+
+        with patch("pg_mcp.services.orchestrator.asyncio.sleep", new=AsyncMock()) as sleep:
+            result = await orchestrator._execute_sql_with_retry(executor, "SELECT 1", "req-1")
+
+        assert result == ([{"value": 1}], 1)
+        sleep.assert_awaited_once_with(0.25)
 
 
 class TestSQLGenerationWithRetry:

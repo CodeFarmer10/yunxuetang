@@ -509,6 +509,23 @@ LIMIT 10;"""
             assert call_kwargs["temperature"] == 0.5
             assert call_kwargs["max_tokens"] == 1000
 
+    def test_custom_openai_compatible_endpoint_is_used(self) -> None:
+        """Test that OpenAI-compatible providers receive their custom base URL."""
+        config = OpenAIConfig(
+            api_key=SecretStr("volcengine-key"),
+            base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+            model="ark-code-latest",
+        )
+
+        with patch("pg_mcp.services.sql_generator.AsyncOpenAI") as mock_client:
+            SQLGenerator(config)
+
+        mock_client.assert_called_once_with(
+            api_key="volcengine-key",
+            base_url="https://ark.cn-beijing.volces.com/api/coding/v3",
+            timeout=30.0,
+        )
+
     @pytest.mark.asyncio
     async def test_generate_includes_schema_context(
         self, generator: SQLGenerator, mock_schema: DatabaseSchema

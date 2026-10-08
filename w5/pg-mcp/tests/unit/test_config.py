@@ -5,6 +5,7 @@ defaults, and environment variable parsing.
 """
 
 import os
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -100,6 +101,7 @@ class TestOpenAIConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = OpenAIConfig(api_key="sk-test123")
+        assert config.base_url is None
         assert config.model == "gpt-4o-mini"
         assert config.max_tokens == 2000
         assert config.temperature == 0.0
@@ -108,12 +110,15 @@ class TestOpenAIConfig:
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
         config = OpenAIConfig(
-            api_key="sk-custom",
+            api_key="volcengine-coding-plan-key",
+            base_url="https://ark.cn-beijing.volces.com/api/coding/v3/",
             model="gpt-4",
             max_tokens=4000,
             temperature=0.7,
             timeout=60.0,
         )
+        assert config.api_key.get_secret_value() == "volcengine-coding-plan-key"
+        assert config.base_url == "https://ark.cn-beijing.volces.com/api/coding/v3"
         assert config.model == "gpt-4"
         assert config.max_tokens == 4000
         assert config.temperature == 0.7
@@ -129,10 +134,10 @@ class TestOpenAIConfig:
         with pytest.raises(ValidationError, match="must not be empty"):
             OpenAIConfig(api_key="   ")
 
-    def test_invalid_api_key_format(self) -> None:
-        """Test API key must start with sk-."""
-        with pytest.raises(ValidationError, match="must start with 'sk-'"):
-            OpenAIConfig(api_key="invalid-key")
+    def test_invalid_base_url(self) -> None:
+        """Test provider base URL must use HTTP(S)."""
+        with pytest.raises(ValidationError, match="must start with http"):
+            OpenAIConfig(api_key="provider-key", base_url="ark.example.com/v3")
 
     def test_invalid_max_tokens(self) -> None:
         """Test invalid max_tokens is rejected."""
@@ -140,7 +145,7 @@ class TestOpenAIConfig:
             OpenAIConfig(api_key="sk-test", max_tokens=50)
 
         with pytest.raises(ValidationError):
-            OpenAIConfig(api_key="sk-test", max_tokens=5000)
+            OpenAIConfig(api_key="sk-test", max_tokens=32769)
 
     def test_invalid_temperature(self) -> None:
         """Test invalid temperature is rejected."""
@@ -162,6 +167,9 @@ class TestSecurityConfig:
         assert config.max_execution_time == 30.0
         assert "pg_sleep" in config.blocked_functions
         assert "pg_read_file" in config.blocked_functions
+        assert config.blocked_tables == []
+        assert config.blocked_columns == []
+        assert config.allow_explain is False
 
     def test_custom_blocked_functions(self) -> None:
         """Test custom blocked functions."""
@@ -183,6 +191,17 @@ class TestSecurityConfig:
         """Test enabling write operations."""
         config = SecurityConfig(allow_write_operations=True)
         assert config.allow_write_operations is True
+
+    def test_parse_access_controls_from_strings(self) -> None:
+        """Test environment-style table and column access-control lists."""
+        config = SecurityConfig(
+            blocked_tables="secrets, audit_log",  # type: ignore[arg-type]
+            blocked_columns="users.password, ssn",  # type: ignore[arg-type]
+            allow_explain=True,
+        )
+        assert config.blocked_tables == ["secrets", "audit_log"]
+        assert config.blocked_columns == ["users.password", "ssn"]
+        assert config.allow_explain is True
 
     def test_invalid_max_rows(self) -> None:
         """Test invalid max_rows is rejected."""
@@ -261,6 +280,9 @@ class TestResilienceConfig:
         assert config.backoff_factor == 2.0
         assert config.circuit_breaker_threshold == 5
         assert config.circuit_breaker_timeout == 60.0
+        assert config.max_concurrent_queries == 10
+        assert config.max_concurrent_llm_calls == 5
+        assert config.rate_limit_timeout == 1.0
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
@@ -332,6 +354,50 @@ class TestSettings:
         assert settings.cache is not None
         assert settings.resilience is not None
         assert settings.observability is not None
+        assert settings.configured_databases == [settings.database]
+
+    def test_nested_settings_from_dotenv(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test flat prefixed keys in .env populate nested settings models."""
+        (tmp_path / ".env").write_text(
+            "\n".join(
+                [
+                    "DATABASE_NAME=homework_db",
+                    "DATABASE_MIN_POOL_SIZE=2",
+                    "OPENAI_API_KEY=volcengine-plan-key",
+                    "OPENAI_BASE_URL=https://ark.example.com/api/coding/v3",
+                    "OPENAI_MODEL=ark-code-latest",
+                    "SECURITY_BLOCKED_TABLES=secrets,audit_log",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+
+        settings = Settings()
+
+        assert settings.database.name == "homework_db"
+        assert settings.database.min_pool_size == 2
+        assert settings.openai.api_key.get_secret_value() == "volcengine-plan-key"
+        assert settings.openai.base_url == "https://ark.example.com/api/coding/v3"
+        assert settings.openai.model == "ark-code-latest"
+        assert settings.security.blocked_tables == ["secrets", "audit_log"]
+
+    def test_multi_database_settings(self) -> None:
+        """Test explicit multi-database configuration and uniqueness validation."""
+        databases = [DatabaseConfig(name="analytics"), DatabaseConfig(name="operations")]
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            databases=databases,
+        )
+        assert settings.configured_databases == databases
+
+        with pytest.raises(ValidationError, match="must be unique"):
+            Settings(
+                openai=OpenAIConfig(api_key="sk-test"),
+                databases=[DatabaseConfig(name="duplicate"), DatabaseConfig(name="duplicate")],
+            )
 
     def test_is_production(self) -> None:
         """Test production environment check."""
@@ -408,6 +474,7 @@ class TestSettingsGlobalInstance:
     def test_settings_from_environment(self) -> None:
         """Test loading settings from environment variables."""
         os.environ["OPENAI_API_KEY"] = "sk-env-key"
+        os.environ["OPENAI_BASE_URL"] = "https://ark.example.com/api/v3"
         os.environ["OPENAI_MODEL"] = "gpt-4"
         os.environ["DATABASE_HOST"] = "env.host.com"
         os.environ["SECURITY_MAX_ROWS"] = "5000"
@@ -417,6 +484,7 @@ class TestSettingsGlobalInstance:
 
         # Use get_secret_value() to access SecretStr content
         assert settings.openai.api_key.get_secret_value() == "sk-env-key"
+        assert settings.openai.base_url == "https://ark.example.com/api/v3"
         assert settings.openai.model == "gpt-4"
         assert settings.database.host == "env.host.com"
         assert settings.security.max_rows == 5000

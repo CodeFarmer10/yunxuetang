@@ -4,6 +4,8 @@ This module provides the CLI entry point for running the MCP server
 using FastMCP with stdio transport.
 """
 
+from contextlib import suppress
+
 import anyio
 
 from pg_mcp.server import mcp
@@ -30,7 +32,8 @@ def main() -> None:
         Run with environment variables:
         >>> DATABASE_HOST=localhost DATABASE_NAME=mydb python -m pg_mcp
     """
-    anyio.run(mcp.run_stdio_async)
+    with suppress(KeyboardInterrupt):
+        anyio.run(mcp.run_stdio_async)
 
 
 if __name__ == "__main__":

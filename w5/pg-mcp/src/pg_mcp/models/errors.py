@@ -133,6 +133,14 @@ class ValidationError(PgMcpError):
         super().__init__(message=message, code=ErrorCode.VALIDATION_FAILED, details=details)
 
 
+class QuestionTooLongError(PgMcpError):
+    """Exception raised when a natural-language question exceeds the configured limit."""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        """Initialize a question length error."""
+        super().__init__(message=message, code=ErrorCode.QUESTION_TOO_LONG, details=details)
+
+
 class SecurityViolationError(PgMcpError):
     """Exception raised when security constraints are violated.
 

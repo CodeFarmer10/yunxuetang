@@ -370,6 +370,16 @@ class TestQueryResponse:
         assert response.generated_sql is not None
         assert response.data is None
 
+    def test_to_dict_has_stable_optional_fields(self) -> None:
+        """Test the public response shape does not depend on a duplicate serializer."""
+        response = QueryResponse(success=True, generated_sql="SELECT 1")
+
+        serialized = response.to_dict()
+
+        assert serialized["data"] is None
+        assert serialized["error"] is None
+        assert serialized["tokens_used"] == 0
+
 
 class TestErrorModels:
     """Tests for error models."""
